@@ -19,59 +19,82 @@ class PositionalEncoding(nn.Module):
         return x
 
 class FoundationEncoder(nn.Module):
-    def __init__(self, in_channels=12, patch_size=50, embed_dim=256, num_layers=4, num_heads=8, seq_length=5000):
+    def __init__(
+        self,
+        in_channels=12,
+        patch_size=50,
+        embed_dim=256,
+        num_layers=8,
+        num_heads=8,
+        seq_length=5000,
+        dropout=0.1,
+        learned_pos=True,
+    ):
         """
         Transformer-based Foundation Encoder for ECG self-supervised learning.
-        
+        Conforms to Section 4.2 of the project specification (ViT/MAE-style pre-norm 1D Transformer).
+
         Args:
-            in_channels (int): Number of ECG leads (default 12).
-            patch_size (int): The size of the signal patch to be embedded as a single token.
-            embed_dim (int): The embedding dimension for the transformer.
-            num_layers (int): Number of transformer encoder layers.
-            num_heads (int): Number of attention heads.
-            seq_length (int): The full length of the input sequence.
+            in_channels (int): Number of ECG leads (default 12 for standard ECG).
+            patch_size (int): The size of the signal patch to be embedded as a single token (default 50 = 100ms @ 500Hz).
+            embed_dim (int): The embedding dimension for the transformer (default 256).
+            num_layers (int): Number of transformer encoder layers (default 8).
+            num_heads (int): Number of attention heads (default 8, 32 dim/head).
+            seq_length (int): The full length of the input sequence (default 5000 = 10s @ 500Hz).
+            dropout (float): Dropout probability for attention and MLP (default 0.1).
+            learned_pos (bool): Whether to use learned positional embeddings (default True).
         """
         super().__init__()
         self.patch_size = patch_size
         self.in_channels = in_channels
         self.embed_dim = embed_dim
-        
-        # Calculate number of patches
+        self.num_layers = num_layers
+        self.learned_pos = learned_pos
+
+        # Calculate number of patches (e.g. 5000 // 50 = 100 patches per lead)
         assert seq_length % patch_size == 0, "seq_length must be divisible by patch_size"
         self.num_patches = seq_length // patch_size
-        
+
         # Patch Embedding using 1D Convolution
-        # It takes in (B, in_channels, L) and outputs (B, embed_dim, L/patch_size)
+        # Input: (B, in_channels, L) -> Output: (B, embed_dim, num_patches)
         self.patch_embed = nn.Conv1d(
-            in_channels=in_channels, 
-            out_channels=embed_dim, 
-            kernel_size=patch_size, 
-            stride=patch_size
+            in_channels=in_channels,
+            out_channels=embed_dim,
+            kernel_size=patch_size,
+            stride=patch_size,
         )
-        
-        # Positional Encoding
-        self.pos_encoder = PositionalEncoding(embed_dim, max_len=self.num_patches)
-        
-        # Transformer Encoder
+
+        # Positional Encoding (learned positional embeddings as recommended default in Sec 4.2)
+        if self.learned_pos:
+            self.pos_embed = nn.Parameter(torch.zeros(1, self.num_patches, embed_dim))
+            nn.init.trunc_normal_(self.pos_embed, std=0.02)
+        else:
+            self.pos_encoder = PositionalEncoding(embed_dim, max_len=self.num_patches)
+
+        self.pos_drop = nn.Dropout(p=dropout)
+
+        # Transformer Encoder: Standard pre-norm blocks (norm_first=True)
+        # LayerNorm -> Multi-Head Attention -> residual -> LayerNorm -> MLP -> residual
         encoder_layer = nn.TransformerEncoderLayer(
-            d_model=embed_dim, 
-            nhead=num_heads, 
+            d_model=embed_dim,
+            nhead=num_heads,
             dim_feedforward=embed_dim * 4,
+            dropout=dropout,
             activation='gelu',
-            batch_first=True
+            batch_first=True,
+            norm_first=True,
         )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-        
-        # Reconstruction Head
-        # Projects the embedding back to the patch size per channel
-        # We need to output in_channels * patch_size values per token
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers, enable_nested_tensor=False)
+        self.norm = nn.LayerNorm(embed_dim)
+
+        # Reconstruction Head: Lightweight single linear layer (hidden_dim -> in_channels * patch_size)
         self.reconstruction_head = nn.Linear(embed_dim, in_channels * patch_size)
-        
+
     def forward_features(self, x):
         """
         Passes the input through the transformer encoder and returns the latent representation.
-        This will be used later as the perceptual features in Phase 2.
-        
+        Used as perceptual features in Phase 2.
+
         Args:
             x: (B, C, L) where C is channels, L is sequence length
         Returns:
@@ -79,15 +102,21 @@ class FoundationEncoder(nn.Module):
         """
         # Patch embedding: (B, C, L) -> (B, embed_dim, num_patches)
         x = self.patch_embed(x)
-        
+
         # Transpose to (B, num_patches, embed_dim) for Transformer
         x = x.transpose(1, 2)
-        
+
         # Add positional encoding
-        x = self.pos_encoder(x)
-        
+        if self.learned_pos:
+            x = x + self.pos_embed
+        else:
+            x = self.pos_encoder(x)
+
+        x = self.pos_drop(x)
+
         # Pass through Transformer Encoder
         features = self.transformer(x)
+        features = self.norm(features)
         return features
 
     def forward(self, x):
